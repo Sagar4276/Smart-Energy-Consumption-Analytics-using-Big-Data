@@ -1,0 +1,23 @@
+services:
+  analytics:
+    build: .
+    container_name: energy-analytics
+    volumes:
+      - ./scripts:/app/scripts
+      - ./data:/app/data
+      - ./model:/app/model
+    command: tail -f /dev/null
+
+    deploy:
+
+
+  dashboard:
+    build: .  # ✅ build from the same Dockerfile, not an image name
+    container_name: energy-dashboard
+    volumes:
+      - ./visualization:/app/visualization
+      - ./data:/app/data
+      - ./model:/app/model
+    ports:
+      - "8501:8501"
+    command: streamlit run /app/visualization/streamlit_app.py --server.port=8501 --server.address=0.0.0.0
