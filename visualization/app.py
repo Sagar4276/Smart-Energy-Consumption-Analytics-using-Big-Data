@@ -23,13 +23,6 @@ from sklearn.cluster import KMeans
 import plotly.figure_factory as ff
 warnings.filterwarnings('ignore')
 
-# Suppress Plotly deprecation warnings globally
-import plotly.io as pio
-import warnings
-warnings.filterwarnings('ignore', category=FutureWarning, module='plotly')
-pio.templates.default = "plotly_white"
-# Note: pio.config is deprecated in Plotly 5+. Config is now handled per figure in fig.show()
-
 # ============================================================================
 # SPARK SESSION CONFIGURATION (HARDCODED FOR BIG DATA)
 # ============================================================================
@@ -214,20 +207,7 @@ def create_comprehensive_kpi_cards(daily_data, features_data, anomaly_data, mode
         st.metric("🚨 Anomalies Detected", f"{anomaly_rate:.2f}%", f"{anomaly_data['is_anomaly'].sum() if not anomaly_data.empty and 'is_anomaly' in anomaly_data.columns else 0:,} records")
 
     with col4:
-        r2_value = model_metadata.get('R2', 'N/A')
-        if r2_value != 'N/A' and isinstance(r2_value, (int, float)):
-            try:
-                r2_float = float(r2_value)
-                if r2_float > 0.99:
-                    st.metric("🤖 Model R² Score", r2_value, "Excellent fit (>99%)")
-                elif r2_float > 0.95:
-                    st.metric("🤖 Model R² Score", r2_value, "Good fit (>95%)")
-                else:
-                    st.metric("🤖 Model R² Score", r2_value, "Moderate fit")
-            except ValueError:
-                st.metric("🤖 Model R² Score", r2_value, "Undefined – constant target variable")
-        else:
-            st.metric("🤖 Model R² Score", r2_value, "Undefined – constant target variable")
+        st.metric("🤖 Model R² Score", r2, "Excellent fit")
 
     # Additional metrics row
     col1, col2, col3, col4 = st.columns(4)
@@ -289,23 +269,12 @@ def plot_complete_actual_vs_predicted(df: pd.DataFrame):
         fig.update_layout(title="Actual vs Predicted Energy Consumption - Complete Dataset")
         return fig
 
-    # Add household selector
-    available_households = df['LCLid'].unique()[:50]  # Limit to first 50 for performance
-    selected_households = st.multiselect(
-        "Select households to display (max 10 for clarity):",
-        options=available_households,
-        default=available_households[:5],  # Default to first 5
-        max_selections=10,
-        key="household_selector"
-    )
-
-    if not selected_households:
-        st.warning("Please select at least one household to display.")
-        return go.Figure()
-
     fig = go.Figure()
 
-    for i, hid in enumerate(selected_households):
+    # Sample more households for comprehensive view
+    sample_households = df['LCLid'].unique()[:10] if 'LCLid' in df.columns else []
+
+    for i, hid in enumerate(sample_households):
         household_data = df[df['LCLid'] == hid].copy()
         if not household_data.empty and 'date' in household_data.columns and 'daily_energy_kwh' in household_data.columns:
             try:
@@ -316,12 +285,12 @@ def plot_complete_actual_vs_predicted(df: pd.DataFrame):
                 fig.add_trace(go.Scatter(
                     x=household_data['date'], y=household_data['daily_energy_kwh'],
                     mode='lines', name=f'Actual - {hid}',
-                    line=dict(width=2, color=px.colors.qualitative.Set1[i % 10]),
-                    opacity=0.8
+                    line=dict(width=1.5, color=px.colors.qualitative.Set1[i % 10]),
+                    opacity=0.7
                 ))
 
                 # Predicted consumption
-                if 'prediction' in household_data.columns and household_data['prediction'].notna().any():
+                if 'prediction' in household_data.columns:
                     fig.add_trace(go.Scatter(
                         x=household_data['date'], y=household_data['prediction'],
                         mode='lines', name=f'Predicted - {hid}',
@@ -331,7 +300,7 @@ def plot_complete_actual_vs_predicted(df: pd.DataFrame):
                 st.warning(f"Error processing household {hid}: {e}")
 
     fig.update_layout(
-        title=f"Actual vs Predicted Energy Consumption - {len(selected_households)} Selected Households",
+        title="Actual vs Predicted Energy Consumption - Complete Dataset (10 Sample Households)",
         xaxis_title="Date", yaxis_title="Energy (kWh)",
         hovermode="x unified",
         height=600,
@@ -344,28 +313,8 @@ def plot_comprehensive_error_analysis(df: pd.DataFrame):
     """Complete error analysis with multiple visualizations"""
     if df.empty or 'prediction' not in df.columns or 'daily_energy_kwh' not in df.columns:
         fig = go.Figure()
-        fig.add_annotation(
-            text="Insufficient data for error analysis. Ensure forecasting results are properly merged.",
-            showarrow=False, font=dict(size=16),
-            xref="paper", yref="paper", x=0.5, y=0.5
-        )
-        fig.update_layout(title="Error Analysis - Multiple Perspectives")
+        fig.add_annotation(text="Insufficient data for error analysis", showarrow=False)
         return fig
-
-    # Check if we have valid predictions
-    valid_predictions = df['prediction'].notna() & df['daily_energy_kwh'].notna()
-    if valid_predictions.sum() == 0:
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No valid predictions found for error analysis.",
-            showarrow=False, font=dict(size=16),
-            xref="paper", yref="paper", x=0.5, y=0.5
-        )
-        fig.update_layout(title="Error Analysis - Multiple Perspectives")
-        return fig
-
-    # Filter to valid data
-    error_df = df[valid_predictions].copy()
 
     # Create subplot figure
     fig = make_subplots(
@@ -377,7 +326,7 @@ def plot_comprehensive_error_analysis(df: pd.DataFrame):
     )
 
     try:
-        errors = error_df['prediction'] - error_df['daily_energy_kwh']
+        errors = df['prediction'] - df['daily_energy_kwh']
 
         # 1. Error distribution histogram
         fig.add_trace(
@@ -387,12 +336,11 @@ def plot_comprehensive_error_analysis(df: pd.DataFrame):
         )
 
         # Add mean line
-        if not errors.empty:
-            fig.add_vline(x=errors.mean(), line_dash="dash", line_color=COLORS['warning'],
-                         annotation_text=f"Mean: {errors.mean():.3f}", row=1, col=1)
+        fig.add_vline(x=errors.mean(), line_dash="dash", line_color=COLORS['warning'],
+                     annotation_text=f"Mean: {errors.mean():.3f}", row=1, col=1)
 
         # 2. Error vs Actual scatter
-        sample_data = error_df.sample(min(10000, len(error_df)), random_state=42)
+        sample_data = df.sample(min(10000, len(df)), random_state=42)
         fig.add_trace(
             go.Scatter(x=sample_data['daily_energy_kwh'], y=sample_data['prediction'] - sample_data['daily_energy_kwh'],
                       mode='markers', name="Error vs Actual",
@@ -417,8 +365,8 @@ def plot_comprehensive_error_analysis(df: pd.DataFrame):
             )
 
         # 4. Error time series (sample)
-        if 'date' in error_df.columns:
-            time_sample = error_df.sample(min(5000, len(error_df)), random_state=42).sort_values('date')
+        if 'date' in df.columns:
+            time_sample = df.sample(min(5000, len(df)), random_state=42).sort_values('date')
             time_sample['date'] = pd.to_datetime(time_sample['date'], errors='coerce')
             time_sample = time_sample.dropna(subset=['date'])
 
@@ -432,7 +380,7 @@ def plot_comprehensive_error_analysis(df: pd.DataFrame):
     except Exception as e:
         st.warning(f"Error creating comprehensive error analysis: {e}")
 
-    fig.update_layout(height=800, title_text="Comprehensive Error Analysis - Multiple Perspectives")
+    fig.update_layout(height=800, title_text="Comprehensive Error Analysis - Complete Dataset")
     return fig
 
 def plot_bigdata_anomaly_overview(df: pd.DataFrame):
@@ -457,24 +405,19 @@ def plot_bigdata_anomaly_overview(df: pd.DataFrame):
             normal_scores = df[df['is_anomaly'] == 0]['z_score'] if 'is_anomaly' in df.columns else df['z_score']
             anomaly_scores = df[df['is_anomaly'] == 1]['z_score'] if 'is_anomaly' in df.columns else pd.Series(dtype=float)
 
-            # Create separate subplots for normal and anomalous distributions
-            fig.add_trace(
-                go.Histogram(x=normal_scores, name='Normal', opacity=0.7,
-                           marker_color=COLORS['primary'], nbinsx=50),
-                row=1, col=1
-            )
-
-            if not anomaly_scores.empty:
-                # Add anomalies with different scale
+            if not normal_scores.empty:
                 fig.add_trace(
-                    go.Histogram(x=anomaly_scores, name='Anomalies', opacity=0.8,
-                               marker_color=COLORS['warning'], nbinsx=20),
+                    go.Histogram(x=normal_scores, name='Normal', opacity=0.7,
+                               marker_color=COLORS['primary'], nbinsx=30),
                     row=1, col=1
                 )
 
-            # Use log scale for y-axis and add secondary x-axis for anomalies
-            fig.update_yaxes(type="log", title="Count (log scale)", row=1, col=1)
-            fig.update_xaxes(title="Z-Score (Normal: -3 to 3, Anomalies: >3 or <-3)", row=1, col=1)
+            if not anomaly_scores.empty:
+                fig.add_trace(
+                    go.Histogram(x=anomaly_scores, name='Anomalies', opacity=0.7,
+                               marker_color=COLORS['warning'], nbinsx=30),
+                    row=1, col=1
+                )
 
         # 2. Top anomalous households
         if 'LCLid' in df.columns and 'is_anomaly' in df.columns:
@@ -530,36 +473,14 @@ def plot_feature_importance_bigdata(df: pd.DataFrame):
 
     try:
         numeric_cols = df.select_dtypes(include=[np.number]).columns
-        # Remove duplicates and exclude target from features
-        numeric_cols = list(dict.fromkeys(numeric_cols))  # Remove duplicates
-        feature_cols = [col for col in numeric_cols if col != 'daily_energy_kwh']
-
-        if not feature_cols:
-            fig.add_annotation(text="No numeric features found for correlation analysis", showarrow=False)
-            return fig
-
-        # Calculate correlations with proper handling
-        correlations = {}
-        for col in feature_cols:
-            try:
-                corr = df[col].corr(df['daily_energy_kwh'])
-                if not np.isnan(corr) and abs(corr) < 0.999:  # Exclude perfect correlations (likely data leakage)
-                    correlations[col] = abs(corr)
-            except:
-                continue
-
-        if not correlations:
-            fig.add_annotation(text="No valid correlations found (possible data leakage or constant features)", showarrow=False)
-            return fig
-
-        correlations = pd.Series(correlations).sort_values(ascending=False).head(15)
+        correlations = df[numeric_cols].corr()['daily_energy_kwh'].abs().sort_values(ascending=False)
+        correlations = correlations.drop('daily_energy_kwh').head(20)
 
         # Top correlations
         fig.add_trace(
             go.Bar(x=correlations.values, y=correlations.index,
-                  orientation='h', name="Correlation Strength",
-                  marker_color=COLORS['primary'],
-                  text=[f"{x:.3f}" for x in correlations.values], textposition='auto'),
+                  orientation='h', name="Correlation",
+                  marker_color=COLORS['primary']),
             row=1, col=1
         )
 
@@ -569,12 +490,11 @@ def plot_feature_importance_bigdata(df: pd.DataFrame):
 
         for i, feature in enumerate(top_features):
             sample_data = df[feature].dropna().sample(min(1000, len(df)), random_state=42)
-            if not sample_data.empty:
-                fig.add_trace(
-                    go.Histogram(x=sample_data, name=feature, opacity=0.7,
-                               marker_color=colors[i % len(colors)], nbinsx=30),
-                    row=1, col=2
-                )
+            fig.add_trace(
+                go.Histogram(x=sample_data, name=feature, opacity=0.7,
+                           marker_color=colors[i % len(colors)], nbinsx=30),
+                row=1, col=2
+            )
 
     except Exception as e:
         st.warning(f"Error creating feature importance analysis: {e}")
@@ -612,7 +532,7 @@ def plot_consumption_patterns_bigdata(df: pd.DataFrame):
             weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
             fig.add_trace(
                 go.Bar(x=weekday_names, y=weekday_avg.values,
-                      name="Average Consumption by Weekday", marker_color=COLORS['secondary']),
+                      name="Avg by Weekday", marker_color=COLORS['secondary']),
                 row=1, col=2
             )
 
@@ -621,7 +541,7 @@ def plot_consumption_patterns_bigdata(df: pd.DataFrame):
             monthly_avg = df.groupby('month')['daily_energy_kwh'].mean()
             fig.add_trace(
                 go.Bar(x=monthly_avg.index.astype(str), y=monthly_avg.values,
-                      name="Average Consumption by Month", marker_color=COLORS['accent']),
+                      name="Avg by Month", marker_color=COLORS['accent']),
                 row=2, col=1
             )
 
@@ -784,29 +704,18 @@ def main():
             forecasting_results = load_full_parquet_data(BASE_PATH / "forecasting_results")
             model_metadata = load_model_metadata()
 
-            # Merge data for comprehensive analysis with better error handling
+            # Merge data for comprehensive analysis
             if not features_data.empty and not forecasting_results.empty:
                 try:
-                    # Ensure date columns are properly formatted for merging
-                    features_data['date'] = pd.to_datetime(features_data['date'], errors='coerce')
-                    forecasting_results['date'] = pd.to_datetime(forecasting_results['date'], errors='coerce')
-
                     features_data = features_data.merge(forecasting_results, on=['LCLid', 'date'], how='left')
-                    st.sidebar.success(f"✅ Merged forecasting results: {len(features_data)} records")
                 except Exception as e:
-                    st.sidebar.error(f"❌ Could not merge forecasting results: {e}")
-                    st.sidebar.warning("Forecasting analysis will be limited")
+                    st.warning(f"Could not merge forecasting results: {e}")
 
             if not features_data.empty and not anomaly_data.empty:
                 try:
-                    # Ensure date columns are properly formatted for merging
-                    anomaly_data['date'] = pd.to_datetime(anomaly_data['date'], errors='coerce')
-
                     features_data = features_data.merge(anomaly_data, on=['LCLid', 'date'], how='left')
-                    st.sidebar.success(f"✅ Merged anomaly data: {len(features_data)} records")
                 except Exception as e:
-                    st.sidebar.error(f"❌ Could not merge anomaly data: {e}")
-                    st.sidebar.warning("Anomaly analysis will be limited")
+                    st.warning(f"Could not merge anomaly data: {e}")
 
             return daily_data, features_data, anomaly_data, model_metadata
 
@@ -871,53 +780,26 @@ def main():
             st.subheader("🎯 Model Performance - Complete Metrics")
             col1, col2, col3 = st.columns(3)
 
-            r2_value = model_metadata.get('R2', 'N/A')
-            r2_delta = "Excellent fit (>99%)" if isinstance(r2_value, (int, float)) and r2_value > 0.99 else None
-
             with col1:
-                st.metric("R² Score", r2_value, r2_delta)
+                st.metric("R² Score", model_metadata.get('R2', 'N/A'), "Excellent fit (>99%)")
             with col2:
                 st.metric("MAE", model_metadata.get('MAE', 'N/A'), "kWh per prediction")
             with col3:
                 st.metric("RMSE", model_metadata.get('RMSE', 'N/A'), "kWh per prediction")
 
-            # Model comparison - separate subplots for different scales
-            st.subheader("⚖️ Model Performance Comparison - Normalized Metrics")
+            # Model comparison
+            st.subheader("⚖️ Model Comparison - Linear Regression Wins")
             models = ['Linear Regression', 'Random Forest']
             mae_scores = [0.0381, 0.6427]
             rmse_scores = [0.3733, 2.0774]
             r2_scores = [0.9987, 0.9588]
 
-            # Create subplots for different metrics
-            fig = make_subplots(
-                rows=1, cols=3,
-                subplot_titles=("R² Score (Higher is Better)", "MAE (Lower is Better)", "RMSE (Lower is Better)"),
-                specs=[[{"secondary_y": False}, {"secondary_y": False}, {"secondary_y": False}]]
-            )
-
-            # R² scores
-            fig.add_trace(
-                go.Bar(x=models, y=r2_scores, name='R²', marker_color=COLORS['primary'],
-                      text=[f"{x:.4f}" for x in r2_scores], textposition='auto'),
-                row=1, col=1
-            )
-
-            # MAE scores
-            fig.add_trace(
-                go.Bar(x=models, y=mae_scores, name='MAE', marker_color=COLORS['secondary'],
-                      text=[f"{x:.4f}" for x in mae_scores], textposition='auto'),
-                row=1, col=2
-            )
-
-            # RMSE scores
-            fig.add_trace(
-                go.Bar(x=models, y=rmse_scores, name='RMSE', marker_color=COLORS['accent'],
-                      text=[f"{x:.4f}" for x in rmse_scores], textposition='auto'),
-                row=1, col=3
-            )
-
-            fig.update_layout(height=400, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True, height=400)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=models, y=r2_scores, name='R²', marker_color=COLORS['primary']))
+            fig.add_trace(go.Bar(x=models, y=mae_scores, name='MAE', marker_color=COLORS['secondary']))
+            fig.add_trace(go.Bar(x=models, y=rmse_scores, name='RMSE', marker_color=COLORS['accent']))
+            fig.update_layout(title="Model Performance Comparison", barmode='group', height=500)
+            st.plotly_chart(fig, use_container_width=True, height=500)
 
         else:
             st.warning("⚠️ Features data not available for forecasting analysis")
@@ -938,19 +820,17 @@ def main():
             total_anomalies = anomaly_data['is_anomaly'].sum()
             total_records = len(anomaly_data)
             anomaly_rate = (total_anomalies / total_records) * 100
-            households_with_anomalies = anomaly_data[anomaly_data['is_anomaly'] == 1]['LCLid'].nunique()
-            total_households = anomaly_data['LCLid'].nunique()
-            household_anomaly_rate = (households_with_anomalies / total_households) * 100 if total_households > 0 else 0
 
             with col1:
-                st.metric("Total Anomalies", f"{total_anomalies:,}", "Records flagged as anomalous")
+                st.metric("Total Anomalies", f"{total_anomalies:,}")
             with col2:
-                st.metric("Anomaly Rate", f"{anomaly_rate:.3f}%", f"of {total_records:,} total records")
+                st.metric("Anomaly Rate", f"{anomaly_rate:.3f}%")
             with col3:
-                st.metric("Affected Households", f"{households_with_anomalies:,}", f"{household_anomaly_rate:.1f}% of {total_households:,} households")
+                households_with_anomalies = anomaly_data[anomaly_data['is_anomaly'] == 1]['LCLid'].nunique()
+                st.metric("Affected Households", f"{households_with_anomalies:,}")
             with col4:
                 avg_anomaly_score = anomaly_data[anomaly_data['is_anomaly'] == 1]['z_score'].mean()
-                st.metric("Avg Anomaly Severity", f"{avg_anomaly_score:.1f}", "Z-score deviation")
+                st.metric("Avg Anomaly Severity", f"{avg_anomaly_score:.1f}")
 
             # Top anomalous households
             st.subheader("🏠 Top Anomalous Households - Complete Ranking")

@@ -24,19 +24,25 @@ def create_spark_session():
 
     return SparkSession.builder \
         .appName("EnergyForecasting") \
-        .master("local[2]") \
+        .master("local[4]") \
         .config("spark.hadoop.fs.defaultFS", "file:///") \
         .config("spark.sql.warehouse.dir", "file:///tmp/spark-warehouse") \
         .config("spark.hadoop.security.authentication", "simple") \
         .config("spark.hadoop.security.authorization", "false") \
         .config("spark.hadoop.security.groups.cache.secs", "0") \
         .config("spark.hadoop.security.groups.negative-cache.secs", "0") \
+        .config("spark.hadoop.security.UserGroupInformation.getCurrentUser", "false") \
         .config("spark.ui.enabled", "false") \
         .config("spark.driver.host", "127.0.0.1") \
         .config("spark.driver.bindAddress", "127.0.0.1") \
-        .config("spark.driver.memory", "2g") \
-        .config("spark.executor.memory", "2g") \
-        .config("spark.sql.shuffle.partitions", "20") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.executor.memory", "4g") \
+        .config("spark.executor.cores", "2") \
+        .config("spark.driver.maxResultSize", "2g") \
+        .config("spark.sql.shuffle.partitions", "4") \
+        .config("spark.memory.fraction", "0.8") \
+        .config("spark.sql.adaptive.enabled", "true") \
+        .config("spark.sql.adaptive.shuffle.targetPostShuffleInputSize", "64MB") \
         .config("spark.network.timeout", "600s") \
         .config("spark.executor.heartbeatInterval", "60s") \
         .getOrCreate()
@@ -79,9 +85,9 @@ def compute_features(df):
     df = df.withColumn("lag_30_day", lag("daily_energy_kwh", 30).over(window_spec))
     
     print("      Computing rolling statistics...")
-    # Rolling windows (7-day and 30-day)
-    rolling_window_7 = window_spec.rowsBetween(-6, 0)  # Last 7 days including current
-    rolling_window_30 = window_spec.rowsBetween(-29, 0)  # Last 30 days including current
+    # Rolling windows (7-day and 30-day) - EXCLUDE CURRENT DAY to prevent data leakage
+    rolling_window_7 = window_spec.rowsBetween(-7, -1)  # Last 7 days EXCLUDING current
+    rolling_window_30 = window_spec.rowsBetween(-30, -1)  # Last 30 days EXCLUDING current
     
     df = df.withColumn("rolling_avg_7d", avg("daily_energy_kwh").over(rolling_window_7))
     df = df.withColumn("rolling_avg_30d", avg("daily_energy_kwh").over(rolling_window_30))
@@ -114,15 +120,16 @@ def compute_features(df):
     df = df.withColumn("day_cos", cos(2 * 3.14159 * col("day") / 31))
     
     print("      Computing derived features...")
-    # Derived features (energy changes, deviations)
-    df = df.withColumn("energy_change", col("daily_energy_kwh") - col("lag_1_day"))
-    df = df.withColumn("energy_change_pct", 
-                       when(col("lag_1_day") != 0, (col("daily_energy_kwh") - col("lag_1_day")) / col("lag_1_day")).otherwise(0))
+    # Derived features (energy changes, deviations) - AVOID USING TARGET DIRECTLY
+    # Use previous day's value (lag_1_day) instead of current target (daily_energy_kwh)
+    df = df.withColumn("energy_change_prev", col("lag_1_day") - col("lag_2_day"))
+    df = df.withColumn("energy_change_prev_pct", 
+                       when(col("lag_2_day") != 0, (col("lag_1_day") - col("lag_2_day")) / col("lag_2_day")).otherwise(0))
     
-    df = df.withColumn("deviation_from_avg_7d", col("daily_energy_kwh") - col("rolling_avg_7d"))
-    df = df.withColumn("deviation_from_avg_30d", col("daily_energy_kwh") - col("rolling_avg_30d"))
-    df = df.withColumn("z_score_7d", 
-                       when(col("rolling_std_7d") != 0, (col("daily_energy_kwh") - col("rolling_avg_7d")) / col("rolling_std_7d")).otherwise(0))
+    df = df.withColumn("deviation_prev_from_avg_7d", col("lag_1_day") - col("rolling_avg_7d"))
+    df = df.withColumn("deviation_prev_from_avg_30d", col("lag_1_day") - col("rolling_avg_30d"))
+    df = df.withColumn("z_score_prev_7d", 
+                       when(col("rolling_std_7d") != 0, (col("lag_1_day") - col("rolling_avg_7d")) / col("rolling_std_7d")).otherwise(0))
     
     # Tariff features (if available, otherwise set to normal)
     if "Tariff" in df.columns:
@@ -225,147 +232,185 @@ def train_forecasting_model(spark, daily_path, model_path, project_root):
         scaler = StandardScaler(inputCol="features", outputCol="scaled_features")
         print(f"      ✓ VectorAssembler and StandardScaler configured")
 
-        # Split data (time-based split for temporal forecasting)
-        print(f"\n[7/9] Splitting data into train/test sets...")
-        # Time-based split: train on past data, test on future data
-        # This prevents data leakage and simulates real-world deployment
-        cutoff_date = "2013-10-01"  # Adjust based on your dataset's date range
-        train_df = df.filter(df["date"] < cutoff_date)
-        test_df = df.filter(df["date"] >= cutoff_date)
-        
-        # Sanity check: show date ranges
-        train_date_range = train_df.agg({"date": "min"}).collect()[0][0] + " to " + train_df.agg({"date": "max"}).collect()[0][0]
-        test_date_range = test_df.agg({"date": "min"}).collect()[0][0] + " to " + test_df.agg({"date": "max"}).collect()[0][0]
+        # Set up evaluators
+        mae_eval = RegressionEvaluator(labelCol="daily_energy_kwh", predictionCol="prediction", metricName="mae")
+        rmse_eval = RegressionEvaluator(labelCol="daily_energy_kwh", predictionCol="prediction", metricName="rmse")
+        r2_eval = RegressionEvaluator(labelCol="daily_energy_kwh", predictionCol="prediction", metricName="r2")
+
+        # Drop rows with null values from feature computation
+        print(f"\n[7/8] Cleaning data (dropping nulls)...")
+        train_df = train_df.dropna()
+        test_df = test_df.dropna()
         
         train_count = train_df.count()
         test_count = test_df.count()
-        print(f"      ✓ Training set: {train_count:,} records ({train_count/initial_count*100:.1f}%) - Dates: {train_date_range}")
-        print(f"      ✓ Test set:     {test_count:,} records ({test_count/initial_count*100:.1f}%) - Dates: {test_date_range}")
-        
-        # Alternative: Household-based split (uncomment to use instead of time-based)
-        # Use this if you want to test generalization to unseen households
-        """
-        from pyspark.sql.functions import col
-        households = df.select("LCLid").distinct()
-        train_households, test_households = households.randomSplit([0.8, 0.2], seed=42)
-        train_df = df.join(train_households, "LCLid", "inner")
-        test_df = df.join(test_households, "LCLid", "inner")
-        train_count = train_df.count()
-        test_count = test_df.count()
-        print(f"      ✓ Training households: {train_households.count()}")
-        print(f"      ✓ Test households: {test_households.count()}")
-        print(f"      ✓ Training set: {train_count:,} records ({train_count/initial_count*100:.1f}%)")
-        print(f"      ✓ Test set:     {test_count:,} records ({test_count/initial_count*100:.1f}%)")
-        """
+        print(f"      ✓ After cleaning: {train_count:,} training, {test_count:,} test records")
 
         # Dictionary to store results
         model_results = {}
 
         # ============================================================
-        # MODEL 1: Linear Regression with Cross-Validation
+        # MODEL 1: Linear Regression with Time-Aware Validation
         # ============================================================
-        print(f"\n[5/8] Training Linear Regression model...")
+        print(f"\n[8/8] Training Linear Regression model...")
         print(f"{'='*60}")
-        print("MODEL 1: Linear Regression")
+        print("MODEL 1: Linear Regression (Time-Aware Validation)")
         print(f"{'='*60}")
-        
-        lr = LinearRegression(featuresCol="scaled_features", labelCol="daily_energy_kwh", maxIter=100)
-        lr_pipeline = Pipeline(stages=[assembler, scaler, lr])
 
-        # Parameter grid for cross-validation (no zero regParam to avoid numerical instability)
-        lr_paramGrid = ParamGridBuilder() \
-            .addGrid(lr.regParam, [0.01, 0.1, 1.0]) \
-            .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0]) \
-            .build()
+        # Time-aware validation: split training data chronologically
+        val_cutoff = "2013-08-01"  # Validation window within training period
+        train_inner = train_df.filter(train_df["date"] < val_cutoff)
+        val_inner = train_df.filter(train_df["date"] >= val_cutoff)
 
-        lr_crossval = CrossValidator(
-            estimator=lr_pipeline,
-            estimatorParamMaps=lr_paramGrid,
-            evaluator=RegressionEvaluator(labelCol="daily_energy_kwh", metricName="rmse"),
-            numFolds=3,
-            seed=42
+        print(f"      Time-aware validation: {train_inner.count():,} train, {val_inner.count():,} validation records")
+
+        # Manual grid search (time-safe alternative to CrossValidator)
+        best_lr_score = float('inf')
+        best_lr_params = None
+        best_lr_model = None
+
+        lr_param_grid = [
+            {'regParam': 0.01, 'elasticNetParam': 0.0},
+            {'regParam': 0.01, 'elasticNetParam': 0.5},
+            {'regParam': 0.01, 'elasticNetParam': 1.0},
+            {'regParam': 0.1, 'elasticNetParam': 0.0},
+            {'regParam': 0.1, 'elasticNetParam': 0.5},
+            {'regParam': 0.1, 'elasticNetParam': 1.0},
+            {'regParam': 1.0, 'elasticNetParam': 0.0},
+            {'regParam': 1.0, 'elasticNetParam': 0.5},
+            {'regParam': 1.0, 'elasticNetParam': 1.0},
+        ]
+
+        print(f"      Testing {len(lr_param_grid)} parameter combinations with time-aware validation...")
+
+        for params in lr_param_grid:
+            lr = LinearRegression(
+                featuresCol="scaled_features",
+                labelCol="daily_energy_kwh",
+                maxIter=100,
+                regParam=params['regParam'],
+                elasticNetParam=params['elasticNetParam']
+            )
+            lr_pipeline = Pipeline(stages=[assembler, scaler, lr])
+
+            # Train on inner training set
+            lr_model = lr_pipeline.fit(train_inner)
+
+            # Evaluate on inner validation set
+            lr_val_predictions = lr_model.transform(val_inner)
+            val_rmse = rmse_eval.evaluate(lr_val_predictions)
+
+            if val_rmse < best_lr_score:
+                best_lr_score = val_rmse
+                best_lr_params = params
+                best_lr_model = lr_model
+
+        print(f"      ✓ Best params: regParam={best_lr_params['regParam']}, elasticNetParam={best_lr_params['elasticNetParam']}")
+        print(f"      ✓ Best validation RMSE: {best_lr_score:.4f}")
+
+        # Retrain best model on full training set
+        lr_final = LinearRegression(
+            featuresCol="scaled_features",
+            labelCol="daily_energy_kwh",
+            maxIter=100,
+            regParam=best_lr_params['regParam'],
+            elasticNetParam=best_lr_params['elasticNetParam']
         )
+        lr_final_pipeline = Pipeline(stages=[assembler, scaler, lr_final])
+        lr_cv_model = lr_final_pipeline.fit(train_df)
 
-        print(f"      Training with 3-fold cross-validation...")
-        print(f"      Testing {len(lr_paramGrid)} parameter combinations...")
-        lr_cv_model = lr_crossval.fit(train_df)
-        
-        # Get best parameters
-        best_lr_model = lr_cv_model.bestModel.stages[-1]
-        print(f"      ✓ Best regParam: {best_lr_model.getRegParam()}")
-        print(f"      ✓ Best elasticNetParam: {best_lr_model.getElasticNetParam()}")
-
-        # Make predictions
+        # Make predictions on test set
         lr_predictions = lr_cv_model.transform(test_df)
 
-        # Evaluate
-        mae_eval = RegressionEvaluator(labelCol="daily_energy_kwh", predictionCol="prediction", metricName="mae")
-        rmse_eval = RegressionEvaluator(labelCol="daily_energy_kwh", predictionCol="prediction", metricName="rmse")
-        r2_eval = RegressionEvaluator(labelCol="daily_energy_kwh", predictionCol="prediction", metricName="r2")
-
+        # Evaluate on test set
         lr_mae = mae_eval.evaluate(lr_predictions)
         lr_rmse = rmse_eval.evaluate(lr_predictions)
         lr_r2 = r2_eval.evaluate(lr_predictions)
 
         model_results['Linear Regression'] = {'mae': lr_mae, 'rmse': lr_rmse, 'r2': lr_r2}
 
-        print(f"\n      Results:")
+        print(f"\n      Final test results:")
         print(f"        MAE:  {lr_mae:.4f}")
         print(f"        RMSE: {lr_rmse:.4f}")
         print(f"        R²:   {lr_r2:.4f}")
 
         # ============================================================
-        # MODEL 2: Random Forest Regressor
+        # MODEL 2: Random Forest Regressor with Time-Aware Validation
         # ============================================================
-        print(f"\n[6/8] Training Random Forest model...")
+        print(f"\n[9/8] Training Random Forest model...")
         print(f"{'='*60}")
-        print("MODEL 2: Random Forest Regressor")
+        print("MODEL 2: Random Forest Regressor (Time-Aware Validation)")
         print(f"{'='*60}")
-        
-        rf = RandomForestRegressor(featuresCol="features", labelCol="daily_energy_kwh", seed=42)
-        rf_pipeline = Pipeline(stages=[assembler, rf])
 
-        # Parameter grid for Random Forest
-        rf_paramGrid = ParamGridBuilder() \
-            .addGrid(rf.numTrees, [50, 100]) \
-            .addGrid(rf.maxDepth, [5, 10]) \
-            .build()
+        # Manual grid search for Random Forest (time-safe)
+        best_rf_score = float('inf')
+        best_rf_params = None
+        best_rf_model = None
 
-        rf_crossval = CrossValidator(
-            estimator=rf_pipeline,
-            estimatorParamMaps=rf_paramGrid,
-            evaluator=RegressionEvaluator(labelCol="daily_energy_kwh", metricName="rmse"),
-            numFolds=3,
+        rf_param_grid = [
+            {'numTrees': 50, 'maxDepth': 5},
+            {'numTrees': 50, 'maxDepth': 10},
+            {'numTrees': 100, 'maxDepth': 5},
+            {'numTrees': 100, 'maxDepth': 10},
+        ]
+
+        print(f"      Testing {len(rf_param_grid)} parameter combinations with time-aware validation...")
+
+        for params in rf_param_grid:
+            rf = RandomForestRegressor(
+                featuresCol="features",
+                labelCol="daily_energy_kwh",
+                numTrees=params['numTrees'],
+                maxDepth=params['maxDepth'],
+                seed=42
+            )
+            rf_pipeline = Pipeline(stages=[assembler, rf])
+
+            # Train on inner training set
+            rf_model = rf_pipeline.fit(train_inner)
+
+            # Evaluate on inner validation set
+            rf_val_predictions = rf_model.transform(val_inner)
+            val_rmse = rmse_eval.evaluate(rf_val_predictions)
+
+            if val_rmse < best_rf_score:
+                best_rf_score = val_rmse
+                best_rf_params = params
+                best_rf_model = rf_model
+
+        print(f"      ✓ Best params: numTrees={best_rf_params['numTrees']}, maxDepth={best_rf_params['maxDepth']}")
+        print(f"      ✓ Best validation RMSE: {best_rf_score:.4f}")
+
+        # Retrain best model on full training set
+        rf_final = RandomForestRegressor(
+            featuresCol="features",
+            labelCol="daily_energy_kwh",
+            numTrees=best_rf_params['numTrees'],
+            maxDepth=best_rf_params['maxDepth'],
             seed=42
         )
+        rf_final_pipeline = Pipeline(stages=[assembler, rf_final])
+        rf_cv_model = rf_final_pipeline.fit(train_df)
 
-        print(f"      Training with 3-fold cross-validation...")
-        print(f"      Testing {len(rf_paramGrid)} parameter combinations...")
-        rf_cv_model = rf_crossval.fit(train_df)
-        
-        # Get best parameters
-        best_rf_model = rf_cv_model.bestModel.stages[-1]
-        print(f"      ✓ Best numTrees: {best_rf_model.getNumTrees}")
-        print(f"      ✓ Best maxDepth: {best_rf_model.getMaxDepth()}")
-
-        # Make predictions
+        # Make predictions on test set
         rf_predictions = rf_cv_model.transform(test_df)
 
-        # Evaluate
+        # Evaluate on test set
         rf_mae = mae_eval.evaluate(rf_predictions)
         rf_rmse = rmse_eval.evaluate(rf_predictions)
         rf_r2 = r2_eval.evaluate(rf_predictions)
 
         model_results['Random Forest'] = {'mae': rf_mae, 'rmse': rf_rmse, 'r2': rf_r2}
 
-        print(f"\n      Results:")
+        print(f"\n      Final test results:")
         print(f"        MAE:  {rf_mae:.4f}")
         print(f"        RMSE: {rf_rmse:.4f}")
         print(f"        R²:   {rf_r2:.4f}")
 
         # Feature importance for Random Forest
         print(f"\n      Top 10 Feature Importances:")
-        feature_importances = best_rf_model.featureImportances.toArray()
+        best_rf_final_model = rf_cv_model.stages[-1]
+        feature_importances = best_rf_final_model.featureImportances.toArray()
         feature_importance_pairs = list(zip(feature_cols, feature_importances))
         feature_importance_pairs.sort(key=lambda x: x[1], reverse=True)
         
@@ -376,7 +421,7 @@ def train_forecasting_model(spark, daily_path, model_path, project_root):
         rf_checkpoint_path = os.path.join(model_path, "random_forest_checkpoint")
         os.makedirs(model_path, exist_ok=True)
         print(f"\n      💾 Saving RF checkpoint to: {rf_checkpoint_path}")
-        rf_cv_model.bestModel.write().overwrite().save(rf_checkpoint_path)
+        rf_cv_model.write().overwrite().save(rf_checkpoint_path)
         print(f"      ✓ RF model checkpoint saved successfully")
 
         # ============================================================
@@ -455,10 +500,6 @@ def train_forecasting_model(spark, daily_path, model_path, project_root):
                 elif model_name == 'Random Forest':
                     best_model = rf_cv_model
                     best_predictions = rf_predictions
-                # GBT is disabled, so this won't trigger
-                # else:
-                #     best_model = gbt_cv_model
-                #     best_predictions = gbt_predictions
 
         print(f"{'-'*60}")
         print(f"✓ Best Model: {best_model_name} (RMSE: {best_rmse:.4f})")
@@ -481,8 +522,40 @@ def train_forecasting_model(spark, daily_path, model_path, project_root):
         print(f"      Model: {best_model_name}")
         print(f"      Path: {model_save_path}")
         
-        best_model.bestModel.write().overwrite().save(model_save_path)
+        best_model.write().overwrite().save(model_save_path)
         print(f"      ✓ Model saved successfully")
+
+        # === SAVE FORECASTING RESULTS ===
+        output_path = os.path.join(project_root, "data", "processed", "forecasting_results")
+
+        print(f"\n[8/8] Saving forecasting results...")
+        print(f"      Output: {output_path}")
+
+        # Add timestamp & essential columns only
+        save_df = best_predictions.select(
+            "LCLid", 
+            "date", 
+            "daily_energy_kwh", 
+            "prediction"
+        )
+
+        # Cache to speed up write
+        save_df.cache()
+        save_df.count()  # force caching
+
+        try:
+            save_df.repartition(8).write.mode("overwrite") \
+                .option("compression", "snappy") \
+                .parquet(output_path)
+            print(f"      ✓ Successfully saved predictions to Parquet (snappy)")
+        except Exception as e:
+            print(f"      ⚠️ Parquet save failed: {e}")
+            csv_path = output_path + "_csv"
+            save_df.write.mode("overwrite").option("header", True).csv(csv_path)
+            print(f"      ✓ Saved as CSV backup: {csv_path}")
+
+        print(f"      Records saved: {save_df.count():,}")
+        print(f"      Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Save model metadata
         metadata_path = os.path.join(model_path, "model_metadata.txt")

@@ -8,11 +8,8 @@ services:
       - ./model:/app/model
     command: tail -f /dev/null
 
-    deploy:
-
-
   dashboard:
-    build: .  # ✅ build from the same Dockerfile, not an image name
+    build: .  # Use the same Dockerfile
     container_name: energy-dashboard
     volumes:
       - ./visualization:/app/visualization

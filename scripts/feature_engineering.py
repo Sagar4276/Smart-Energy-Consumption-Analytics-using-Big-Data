@@ -92,33 +92,33 @@ def create_features(spark, input_path, output_path, batch_df=None):
     # Rolling averages
     print(f"\n[4/7] Creating rolling average features...")
     df = df.withColumn("rolling_avg_7d", 
-                       avg("daily_energy_kwh").over(window_spec.rowsBetween(-6, 0)))
+                       avg("daily_energy_kwh").over(window_spec.rowsBetween(-7, -1)))
     print(f"      ✓ Created rolling_avg_7d")
     
     df = df.withColumn("rolling_avg_30d", 
-                       avg("daily_energy_kwh").over(window_spec.rowsBetween(-29, 0)))
+                       avg("daily_energy_kwh").over(window_spec.rowsBetween(-30, -1)))
     print(f"      ✓ Created rolling_avg_30d")
 
     # Rolling standard deviation
     print(f"\n[5/7] Creating rolling statistics features...")
     df = df.withColumn("rolling_std_7d", 
-                       stddev("daily_energy_kwh").over(window_spec.rowsBetween(-6, 0)))
+                       stddev("daily_energy_kwh").over(window_spec.rowsBetween(-7, -1)))
     print(f"      ✓ Created rolling_std_7d")
     
     df = df.withColumn("rolling_std_30d", 
-                       stddev("daily_energy_kwh").over(window_spec.rowsBetween(-29, 0)))
+                       stddev("daily_energy_kwh").over(window_spec.rowsBetween(-30, -1)))
     print(f"      ✓ Created rolling_std_30d")
     
     # Rolling min/max for anomaly detection
     df = df.withColumn("rolling_min_7d", 
-                       min("daily_energy_kwh").over(window_spec.rowsBetween(-6, 0)))
+                       min("daily_energy_kwh").over(window_spec.rowsBetween(-7, -1)))
     df = df.withColumn("rolling_max_7d", 
-                       max("daily_energy_kwh").over(window_spec.rowsBetween(-6, 0)))
+                       max("daily_energy_kwh").over(window_spec.rowsBetween(-7, -1)))
     print(f"      ✓ Created rolling_min_7d and rolling_max_7d")
     
     # Rolling sum for weekly total
     df = df.withColumn("rolling_sum_7d", 
-                       spark_sum("daily_energy_kwh").over(window_spec.rowsBetween(-6, 0)))
+                       spark_sum("daily_energy_kwh").over(window_spec.rowsBetween(-7, -1)))
     print(f"      ✓ Created rolling_sum_7d")
 
     # Day of week features
