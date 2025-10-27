@@ -127,6 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+model/*
 
 # Big Data / Analytics specific
 # Data files (raw and processed)
@@ -136,6 +137,7 @@ data/processed/
 data/*.csv
 data/*.parquet
 data/*.json
+data/*
 
 # Model files
 models/
